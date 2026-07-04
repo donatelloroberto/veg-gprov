@@ -8,6 +8,14 @@
     "disabled": false
   },
   {
+  "display_name": "ConteudoG",
+  "value": "conteudog",
+  "version": "1.0",
+  "icon": "",
+  "type": "global",
+  "disabled": false
+},
+  {
     "display_name": "MultiStream",
     "value": "autoEmbed",
     "version": "1.6",
