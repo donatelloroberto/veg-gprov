@@ -280,25 +280,59 @@ function extractIframeSrc(embedHtml: string): string {
 
 export function extractPlayers(html: string): PlayerEntry[] {
   const players: PlayerEntry[] = [];
-  const addPlayer = (serverValue: unknown, embedValue: unknown) => {
-    const rawEmbed = String(embedValue ?? "")
+  const decodeHtml = (value: unknown): string =>
+    String(value ?? "")
       .replace(/\\\//g, "/")
-      .replace(/&quot;/g, '"')
-      .replace(/&#0?39;|&apos;/g, "'")
-      .replace(/&amp;/g, "&");
+      .replace(/&quot;/gi, '"')
+      .replace(/&#x27;|&#0?39;|&apos;/gi, "'")
+      .replace(/&amp;/gi, "&")
+      .trim();
+
+  const knownLabel = (value: string): string => {
+    const text = value.toLowerCase();
+    if (/voe(?:stream)?/.test(text)) return "VoeStream";
+    if (/vinovo/.test(text)) return "Vinovo";
+    if (/mixdrop/.test(text)) return "MixDrop";
+    if (/dood(?:stream)?/.test(text)) return "DoodStream";
+    if (/streamtape/.test(text)) return "StreamTape";
+    if (/filemoon/.test(text)) return "FileMoon";
+    if (/streamwish/.test(text)) return "StreamWish";
+    if (/vidhide/.test(text)) return "VidHide";
+    if (/uqload/.test(text)) return "Uqload";
+    if (/lulustream/.test(text)) return "LuluStream";
+    if (/wolfstream/.test(text)) return "WolfStream";
+    if (/playmogo/.test(text)) return "PlayMogo";
+    return "";
+  };
+
+  const addPlayer = (serverValue: unknown, embedValue: unknown) => {
+    const rawEmbed = decodeHtml(embedValue);
     const embedUrl = /<iframe\b/i.test(rawEmbed)
       ? extractIframeSrc(rawEmbed)
       : absoluteUrl(rawEmbed, `${BASE_URL}/`);
     if (!embedUrl || !/^https?:\/\//i.test(embedUrl)) return;
     if (players.some((player) => player.embedUrl === embedUrl)) return;
+    const explicit = cleanPlayerLabel(decodeHtml(serverValue));
     players.push({
-      server: String(serverValue || hostLabel(embedUrl) || `Player ${players.length + 1}`),
+      server: explicit || knownLabel(embedUrl) || hostLabel(embedUrl) || `Player ${players.length + 1}`,
       embedUrl,
     });
   };
 
-  // Current ConteudoG pages expose a JS players array. Accept both strict JSON
-  // and ordinary JS object-literal syntax (single quotes / unquoted keys).
+  const urlFromText = (value: string): string[] => {
+    const decoded = decodeHtml(value);
+    const urls: string[] = [];
+    const re = /https?:\\?\/\\?\/[^\s"'<>),;]+/gi;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(decoded)) !== null) {
+      urls.push(match[0].replace(/\\\//g, "/"));
+    }
+    const iframeSrc = extractIframeSrc(decoded);
+    if (iframeSrc) urls.push(iframeSrc);
+    return urls;
+  };
+
+  // 1) Current/legacy ConteudoG JS arrays.
   const arrayMatch =
     /(?:const|let|var)\s+players\s*=\s*(\[[\s\S]*?\])\s*;/i.exec(html) ||
     /players\s*:\s*(\[[\s\S]*?\])/i.exec(html);
@@ -308,28 +342,84 @@ export function extractPlayers(html: string): PlayerEntry[] {
     try {
       const parsed = JSON.parse(source);
       for (const entry of parsed) {
-        addPlayer(entry?.servidor || entry?.server || entry?.name, entry?.embed || entry?.url || entry?.link);
+        addPlayer(entry?.servidor || entry?.server || entry?.name || entry?.title, entry?.embed || entry?.url || entry?.link || entry?.src);
       }
     } catch {
       const objectRegex = /\{([\s\S]*?)\}/g;
       let objectMatch: RegExpExecArray | null;
       while ((objectMatch = objectRegex.exec(source)) !== null) {
         const objectText = objectMatch[1];
-        const serverMatch = /(?:servidor|server|name)\s*:\s*(["'])([\s\S]*?)\1/i.exec(objectText);
-        const embedMatch = /(?:embed|url|link)\s*:\s*(["'])([\s\S]*?)\1/i.exec(objectText);
+        const serverMatch = /(?:servidor|server|name|title)\s*:\s*(["'])([\s\S]*?)\1/i.exec(objectText);
+        const embedMatch = /(?:embed|url|link|src)\s*:\s*(["'])([\s\S]*?)\1/i.exec(objectText);
         if (embedMatch?.[2]) addPlayer(serverMatch?.[2], embedMatch[2]);
       }
     }
   }
 
-  // Fallback for pages that render players directly as iframes or lazy iframes.
+  // 2) Object-map syntax, e.g. players = { vinovo: "https://...", mixdrop: "https://..." }.
+  const mapRegex = /(?:const|let|var)?\s*(?:players|playerLinks|playerUrls|servidores|servers)\s*=\s*\{([\s\S]*?)\}\s*;?/gi;
+  let mapMatch: RegExpExecArray | null;
+  while ((mapMatch = mapRegex.exec(html)) !== null) {
+    const body = mapMatch[1];
+    const pairRegex = /["']?([\w.-]+)["']?\s*:\s*(["'])([\s\S]*?)\2/g;
+    let pair: RegExpExecArray | null;
+    while ((pair = pairRegex.exec(body)) !== null) addPlayer(pair[1], pair[3]);
+  }
+
+  // 3) Player tabs/buttons. ConteudoG swaps #player-area when a tab is clicked,
+  // so inspect onclick and data-* payloads instead of only the active iframe.
+  const tagRegex = /<(button|a|div|span)\b([^>]*)>([\s\S]*?)<\/\1>/gi;
+  let tagMatch: RegExpExecArray | null;
+  while ((tagMatch = tagRegex.exec(html)) !== null) {
+    const attrs = tagMatch[2] || "";
+    const inner = tagMatch[3] || "";
+    const visibleText = cleanPlayerLabel(inner.replace(/<[^>]+>/g, " "));
+    const label = knownLabel(visibleText) || visibleText;
+
+    const attrPayloads: string[] = [];
+    const attrRe = /(?:onclick|data-(?:src|url|link|embed|player|iframe|video|server-url))\s*=\s*(["'])([\s\S]*?)\1/gi;
+    let attr: RegExpExecArray | null;
+    while ((attr = attrRe.exec(attrs)) !== null) attrPayloads.push(attr[2]);
+
+    for (const payload of attrPayloads) {
+      for (const url of urlFromText(payload)) addPlayer(label || knownLabel(payload), url);
+    }
+  }
+
+  // 4) Known host URLs embedded anywhere in inline JavaScript. This catches
+  // tab handlers that keep URLs in switch/case blocks or function calls.
+  const hostUrlRegex = /https?:\\?\/\\?\/[^\s"'<>]+(?:voe|vinovo|mixdrop|dood|streamtape|filemoon|streamwish|vidhide|uqload|lulustream|wolfstream|playmogo)[^\s"'<>]*/gi;
+  let hostUrlMatch: RegExpExecArray | null;
+  while ((hostUrlMatch = hostUrlRegex.exec(html)) !== null) {
+    const url = hostUrlMatch[0].replace(/\\\//g, "/");
+    addPlayer(knownLabel(url), url);
+  }
+
+  // 5) Generic quoted URLs on supported embed-style paths, useful when the
+  // hostname appears before the path and does not match the regex above.
+  const embedUrlRegex = /(["'])(https?:\\?\/\\?\/[^"']+\/(?:e|embed|v|d)\/[^"']+)\1/gi;
+  let embedUrlMatch: RegExpExecArray | null;
+  while ((embedUrlMatch = embedUrlRegex.exec(html)) !== null) {
+    const url = embedUrlMatch[2].replace(/\\\//g, "/");
+    addPlayer(knownLabel(url), url);
+  }
+
+  // 6) Active/default iframe and lazy iframe fallbacks.
   const iframeRegex = /<iframe\b[^>]*(?:src|data-src)\s*=\s*['"]([^'"]+)['"][^>]*>/gi;
   let iframeMatch: RegExpExecArray | null;
   while ((iframeMatch = iframeRegex.exec(html)) !== null) {
-    addPlayer(hostLabel(iframeMatch[1]), iframeMatch[1]);
+    addPlayer(knownLabel(iframeMatch[1]) || hostLabel(iframeMatch[1]), iframeMatch[1]);
   }
 
   return players;
+}
+
+function cleanPlayerLabel(value: string): string {
+  return String(value || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
 }
 
 function collectPlayableCandidates(text: string, embedUrl: string): string[] {
