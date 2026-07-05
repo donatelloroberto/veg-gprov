@@ -197,7 +197,7 @@ function toStream(
 function dedupeStreams(streams: Stream[]): Stream[] {
   const seen = new Set<string>();
   return streams.filter((stream) => {
-    const key = `${stream.server}|${stream.link}`;
+    const key = stream.link;
     if (!stream?.link || seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -622,78 +622,120 @@ async function resolveVoe(
   });
 }
 
-function deobfuscateStreamTapeString(raw: string): string {
-  let value = String(raw || "")
-    .replace(/&amp;/g, "&")
+function cleanStreamTapeFragment(raw: string): string {
+  return String(raw || "")
+    .replace(/&amp;/gi, "&")
     .replace(/\\\//g, "/")
-    .replace(/\s+/g, "")
+    .replace(/^\s*["'`]+|["'`;<>]+\s*$/g, "")
     .trim();
-  if (!value) return "";
-
-  value = value.replace(/^["'`]+|["'`;<>]+$/g, "");
-  value = value.replace(/(https?:\/\/)?streamtape\.com[a-z0-9_-]{1,40}(?=\/)/gi, (_all, scheme) => `${scheme || ""}streamtape.com`);
-  value = value.replace(/(\/\/)?streamtape\.com[a-z0-9_-]{1,40}(?=\/)/gi, (_all, slash) => `${slash || ""}streamtape.com`);
-  value = value.replace(/\/get_vi[\w-]*deo(?=\?)/gi, "/get_video");
-  value = value.replace(/\/get_vide?o(?=\?)/gi, "/get_video");
-  value = value.replace(/([?&])(?:[a-z]{2,24})?(id|expires|ip|token|stream)=/gi, "$1$2=");
-  value = value.replace(/([?&])stream=1(&|$)/i, "$1").replace(/[?&]$/, "");
-  return value;
 }
 
-function normalizeStreamTapeUrl(raw: string, embedUrl: string): string {
-  let value = deobfuscateStreamTapeString(raw);
+function canonicalStreamTapeEmbed(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (/\/e\//i.test(parsed.pathname)) parsed.pathname = parsed.pathname.replace(/\/e\//i, "/v/");
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+function normalizeExactStreamTapeUrl(raw: string, embedUrl: string): string {
+  let value = cleanStreamTapeFragment(raw);
   if (!value) return "";
   if (value.startsWith("//")) value = `https:${value}`;
-  if (/^streamtape\.com\//i.test(value)) value = `https://${value}`;
   if (value.startsWith("/")) value = new URL(value, "https://streamtape.com/").toString();
   if (!/^https?:\/\//i.test(value)) value = absoluteUrl(value, embedUrl || "https://streamtape.com/");
-  value = deobfuscateStreamTapeString(value);
 
   try {
     const parsed = new URL(value);
-    if (!/^streamtape\.com$/i.test(parsed.hostname)) return "";
+    if (!/streamtape\./i.test(parsed.hostname)) return "";
     parsed.protocol = "https:";
-    parsed.hostname = "streamtape.com";
     parsed.pathname = parsed.pathname.replace(/\/get_vi[\w-]*deo/gi, "/get_video");
+    if (parsed.pathname !== "/get_video") return parsed.toString();
 
     const id = parsed.searchParams.get("id");
     const expires = parsed.searchParams.get("expires");
     const ip = parsed.searchParams.get("ip");
     const token = parsed.searchParams.get("token");
-    if (parsed.pathname === "/get_video" && id && expires && ip && token) {
-      return `https://streamtape.com/get_video?id=${encodeURIComponent(id)}&expires=${encodeURIComponent(expires)}&ip=${encodeURIComponent(ip)}&token=${encodeURIComponent(token)}`;
-    }
-    return parsed.toString();
+    if (!(id && expires && ip && token)) return "";
+    const out = new URL("https://streamtape.com/get_video");
+    out.searchParams.set("id", id);
+    out.searchParams.set("expires", expires);
+    out.searchParams.set("ip", ip);
+    out.searchParams.set("token", token);
+    out.searchParams.set("stream", "1");
+    return out.toString();
   } catch {
     return "";
   }
 }
 
-function collectStreamTapeUrls(body: string, embedUrl: string): string[] {
-  const raw = String(body || "").replace(/&amp;/g, "&").replace(/\\\//g, "/");
-  const output: string[] = [];
-  let match: RegExpExecArray | null;
+function extractExactStreamTapeUrl(body: string, embedUrl: string): string {
+  const html = String(body || "");
 
-  const fullRegex = /(?:https?:)?\/\/streamtape\.com[a-z0-9_-]{0,40}\/get_vi[\w-]*deo\?[^"'<>\s\\]+/gi;
-  while ((match = fullRegex.exec(raw)) !== null) output.push(normalizeStreamTapeUrl(match[0], embedUrl));
+  // Current/legacy StreamTape flow: hidden #ideoooolink contains the URL base,
+  // while the token is assigned into #norobotlink by JavaScript.
+  const hidden = firstMatch(html, [
+    /<div[^>]+id=["']ideoooolink["'][^>]*>([\s\S]*?)<\/div>/i,
+    /<[^>]+id=["']ideoooolink["'][^>]*>([\s\S]*?)<\//i,
+  ]).replace(/<[^>]+>/g, "").trim();
 
-  const relativeRegex = /\/get_vi[\w-]*deo\?[^"'<>\s\\]+/gi;
-  while ((match = relativeRegex.exec(raw)) !== null) {
-    output.push(normalizeStreamTapeUrl(`https://streamtape.com${match[0]}`, embedUrl));
+  const noRobotExpr = firstMatch(html, [
+    /document\.getElementById\(["']norobotlink["']\)\.innerHTML\s*=\s*([\s\S]*?);/i,
+    /(?:innerHTML|href)\s*=\s*([\s\S]*?get_video[\s\S]*?);/i,
+  ]);
+  const token = firstMatch(noRobotExpr || html, [
+    /[?&]token=([^&"'`+\s;]+)/i,
+    /token\s*[:=]\s*["']([^"']+)["']/i,
+  ]);
+
+  if (hidden && token) {
+    let base = cleanStreamTapeFragment(hidden);
+    if (base.startsWith("//")) base = `https:${base}`;
+    else if (base.startsWith("/")) base = `https://streamtape.com${base}`;
+    else if (!/^https?:\/\//i.test(base)) base = `https:/${base}`;
+    const joiner = base.includes("?") ? "&" : "?";
+    const exact = normalizeExactStreamTapeUrl(`${base}${joiner}token=${token}`, embedUrl);
+    if (exact) return exact;
   }
 
-  const cleaned = deobfuscateStreamTapeString(raw);
-  const paramsRegex = /id=([a-z0-9]+)&expires=([0-9]+)&ip=([A-Za-z0-9_-]+)&token=([A-Za-z0-9_-]+)/gi;
-  while ((match = paramsRegex.exec(cleaned)) !== null) {
-    output.push(`https://streamtape.com/get_video?id=${match[1]}&expires=${match[2]}&ip=${match[3]}&token=${match[4]}`);
-  }
+  // Fallback only to complete, self-contained get_video URLs. Do not scrape
+  // id/expires/ip/token independently from the whole document because that can
+  // fabricate invalid token combinations.
+  const full = firstMatch(html.replace(/&amp;/gi, "&").replace(/\\\//g, "/"), [
+    /((?:https?:)?\/\/[^"'<>\s]+\/get_video\?[^"'<>\s]+)/i,
+    /(\/get_video\?[^"'<>\s]+)/i,
+  ]);
+  return full ? normalizeExactStreamTapeUrl(full, embedUrl) : "";
+}
 
-  const concatRegex = /["'`]([^"'`]{0,180}(?:streamtape\.com|\/get_vi)[^"'`]{0,240})["'`]\s*\+\s*["'`]([^"'`]{0,240})["'`]/gi;
-  while ((match = concatRegex.exec(raw)) !== null) {
-    output.push(normalizeStreamTapeUrl(`${match[1] || ""}${match[2] || ""}`, embedUrl));
+async function resolveStreamTapeFinalUrl({
+  url,
+  embedUrl,
+  signal,
+  providerContext,
+}: {
+  url: string;
+  embedUrl: string;
+  signal?: AbortSignal;
+  providerContext: ProviderContext;
+}): Promise<string> {
+  try {
+    const response = await providerContext.axios.get(url, {
+      signal,
+      headers: streamHeaders(embedUrl, url, { Range: "bytes=0-1" }),
+      responseType: "arraybuffer",
+      maxRedirects: 5,
+      maxContentLength: 256 * 1024,
+      validateStatus: () => true,
+    });
+    const finalUrl = responseUrl(response, url);
+    if (isProbablyMediaResponse(response, url) && /^https?:\/\//i.test(finalUrl)) return finalUrl;
+  } catch (error) {
+    console.log("ConteudoG StreamTape redirect resolve failed", String(error));
   }
-
-  return output.map((url) => normalizeStreamTapeUrl(url, embedUrl)).filter(Boolean);
+  return "";
 }
 
 async function resolveStreamTape(
@@ -702,19 +744,28 @@ async function resolveStreamTape(
   signal: AbortSignal | undefined,
   providerContext: ProviderContext,
 ): Promise<Stream[]> {
-  const body = await fetchText({ url: embedUrl, referer: `${BASE_URL}/`, signal, providerContext });
-  const candidates = collectStreamTapeUrls(body, embedUrl);
-  const directRegex = /["'](https?:\/\/[^"']+(?:\.mp4|\.m3u8)[^"']*)["']/gi;
-  let match: RegExpExecArray | null;
-  while ((match = directRegex.exec(body)) !== null) candidates.push(match[1]);
+  const pageUrl = canonicalStreamTapeEmbed(embedUrl);
+  const body = await fetchText({ url: pageUrl, referer: `${BASE_URL}/`, signal, providerContext });
+  const exactGetVideo = extractExactStreamTapeUrl(body, pageUrl);
+  if (!exactGetVideo) return [];
 
-  return candidatesToStreams({
-    candidates: candidates.map((url) => normalizeStreamTapeUrl(url, embedUrl) || url),
-    server: server || "StreamTape",
-    referer: embedUrl,
+  const finalUrl = await resolveStreamTapeFinalUrl({
+    url: exactGetVideo,
+    embedUrl: pageUrl,
     signal,
     providerContext,
   });
+
+  // Return one canonical stream only. A raw get_video URL is short-lived and
+  // often bound to the extraction request/IP, so exposing several guessed
+  // variants creates duplicate entries that fail in Vega.
+  if (!finalUrl) return [];
+  return [
+    toStream(finalUrl, server || "StreamTape", pageUrl, {
+      Referer: pageUrl,
+      Origin: streamOrigin(pageUrl),
+    }),
+  ];
 }
 
 async function postAndCollect({
