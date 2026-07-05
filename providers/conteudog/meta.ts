@@ -8,6 +8,7 @@ import {
   parsePostsFromHtml,
   slugFromUrl,
 } from "./common";
+import { extractPlayers, hostLabel } from "./extractors";
 
 async function findPosterForPage(
   pageUrl: string,
@@ -87,13 +88,20 @@ export const getMeta = async function ({
       image = await findPosterForPage(pageUrl, providerContext);
     }
 
-    const directLinks: NonNullable<Link["directLinks"]> = [
-      {
-        title: "Play",
-        link: pageUrl,
-        type: "movie",
-      },
-    ];
+    const players = extractPlayers(html);
+    const directLinks: NonNullable<Link["directLinks"]> = players.length
+      ? players.map((player, index) => ({
+          title: cleanText(player.server) || hostLabel(player.embedUrl) || `Player ${index + 1}`,
+          link: player.embedUrl,
+          type: "movie" as const,
+        }))
+      : [
+          {
+            title: "Auto Resolve",
+            link: pageUrl,
+            type: "movie" as const,
+          },
+        ];
 
     return {
       title,

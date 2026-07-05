@@ -10,7 +10,7 @@ import {
 const DEAD_HOST_RE = /(?:^|\.)(?:minochinos\.com)$/i;
 const MEDIA_URL_RE = /(\.m3u8(?:\?|$)|\.mp4(?:\?|$)|\.mkv(?:\?|$)|\.webm(?:\?|$)|\/hls\/|\/manifest\/|\/video\/|\/file\/|\/media\/|get_video\?|videoplayback|\/stream\/|\/dl\?)/i;
 
-interface PlayerEntry {
+export interface PlayerEntry {
   server: string;
   embedUrl: string;
 }
@@ -227,13 +227,16 @@ async function candidatesToStreams({
     if (!candidate || seen.has(candidate)) continue;
     seen.add(candidate);
 
+    // Verification is best-effort only. Many supported hosts reject server-side
+    // Range/HEAD probes while the same URL plays correctly in Vega with Referer.
     const checked = await verifiedMediaUrl({
       url: candidate,
       referer,
       signal,
       providerContext,
     });
-    if (checked) output.push(toStream(checked, server || hostLabel(checked), referer, extraHeaders));
+    const playable = checked || candidate;
+    output.push(toStream(playable, server || hostLabel(playable), referer, extraHeaders));
   }
 
   return dedupeStreams(output);
@@ -277,29 +280,53 @@ function extractIframeSrc(embedHtml: string): string {
 
 export function extractPlayers(html: string): PlayerEntry[] {
   const players: PlayerEntry[] = [];
-  const scriptMatch =
-    /const\s+players\s*=\s*(\[[\s\S]*?\])\s*;\s*<\/script>/i.exec(html) ||
-    /var\s+players\s*=\s*(\[[\s\S]*?\])\s*;/i.exec(html);
+  const addPlayer = (serverValue: unknown, embedValue: unknown) => {
+    const rawEmbed = String(embedValue ?? "")
+      .replace(/\\\//g, "/")
+      .replace(/&quot;/g, '"')
+      .replace(/&#0?39;|&apos;/g, "'")
+      .replace(/&amp;/g, "&");
+    const embedUrl = /<iframe\b/i.test(rawEmbed)
+      ? extractIframeSrc(rawEmbed)
+      : absoluteUrl(rawEmbed, `${BASE_URL}/`);
+    if (!embedUrl || !/^https?:\/\//i.test(embedUrl)) return;
+    if (players.some((player) => player.embedUrl === embedUrl)) return;
+    players.push({
+      server: String(serverValue || hostLabel(embedUrl) || `Player ${players.length + 1}`),
+      embedUrl,
+    });
+  };
 
-  if (scriptMatch?.[1]) {
+  // Current ConteudoG pages expose a JS players array. Accept both strict JSON
+  // and ordinary JS object-literal syntax (single quotes / unquoted keys).
+  const arrayMatch =
+    /(?:const|let|var)\s+players\s*=\s*(\[[\s\S]*?\])\s*;/i.exec(html) ||
+    /players\s*:\s*(\[[\s\S]*?\])/i.exec(html);
+
+  if (arrayMatch?.[1]) {
+    const source = arrayMatch[1];
     try {
-      const parsed = JSON.parse(scriptMatch[1]);
+      const parsed = JSON.parse(source);
       for (const entry of parsed) {
-        const embedUrl = extractIframeSrc(String(entry?.embed || ""));
-        if (embedUrl) players.push({ server: String(entry?.servidor || "Server"), embedUrl });
+        addPlayer(entry?.servidor || entry?.server || entry?.name, entry?.embed || entry?.url || entry?.link);
       }
     } catch {
-      // Fall through to iframe extraction.
+      const objectRegex = /\{([\s\S]*?)\}/g;
+      let objectMatch: RegExpExecArray | null;
+      while ((objectMatch = objectRegex.exec(source)) !== null) {
+        const objectText = objectMatch[1];
+        const serverMatch = /(?:servidor|server|name)\s*:\s*(["'])([\s\S]*?)\1/i.exec(objectText);
+        const embedMatch = /(?:embed|url|link)\s*:\s*(["'])([\s\S]*?)\1/i.exec(objectText);
+        if (embedMatch?.[2]) addPlayer(serverMatch?.[2], embedMatch[2]);
+      }
     }
   }
 
-  const iframeRegex = /<iframe\b[^>]*src\s*=\s*['"]([^'"]+)['"][^>]*>/gi;
+  // Fallback for pages that render players directly as iframes or lazy iframes.
+  const iframeRegex = /<iframe\b[^>]*(?:src|data-src)\s*=\s*['"]([^'"]+)['"][^>]*>/gi;
   let iframeMatch: RegExpExecArray | null;
   while ((iframeMatch = iframeRegex.exec(html)) !== null) {
-    const embedUrl = absoluteUrl(iframeMatch[1], `${BASE_URL}/`);
-    if (embedUrl && !players.some((player) => player.embedUrl === embedUrl)) {
-      players.push({ server: hostLabel(embedUrl), embedUrl });
-    }
+    addPlayer(hostLabel(iframeMatch[1]), iframeMatch[1]);
   }
 
   return players;
